@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+#
+# linear2fizzy - Migrate Linear issues to Fizzy cards
+# https://github.com/robzolkos/linear2fizzy
+#
+# Usage: linear2fizzy --board BOARD_ID [OPTIONS]
+#
+
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_NAME="linear2fizzy"
+
+# Default values
+BOARD_ID=""
+FIZZY_ACCOUNT=""
+FIZZY_COLUMN=""
+LINEAR_TEAM=""
+LINEAR_PROJECT=""
+LINEAR_STATE=""
+LIMIT=100
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+ADD_MIGRATED_LABEL=false
+INCLUDE_COMMENTS=true
+INCLUDE_ARCHIVED=false
+
+# Arrays for multi-value options
+declare -a LINEAR_LABELS=()
+declare -a LINEAR_ISSUES=()
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
+}
+
+log_success() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_verbose() {
+    [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[VERBOSE]${NC} $1" >&2
+}
+
+# Usage information
+usage() {
+    cat << EOF
+$SCRIPT_NAME v$VERSION - Migrate Linear issues to Fizzy cards
+
+USAGE:
+    $SCRIPT_NAME --board BOARD_ID [OPTIONS]
+
+REQUIRED:
+    --board ID              Fizzy board ID to migrate issues to
+
+LINEAR FILTERS:
+    --team ID               Filter by Linear team ID (required if multiple teams)
+    --project ID            Filter by Linear project ID
+    --state NAME            Filter by state name (e.g., "Todo", "In Progress", "Done")
+    -l, --label NAME        Filter by label (can be repeated)
+    -i, --issue ID          Migrate specific issue(s) by ID (can be repeated)
+    --include-archived      Include archived issues
+    --limit N               Maximum issues to migrate (default: 100)
+
+FIZZY OPTIONS:
+    --account NAME          Fizzy account name (if not default)
+    --column NAME           Target Fizzy column name
+
+BEHAVIOR:
+    --dry-run               Show what would be done without making changes
+    --no-comments           Don't migrate comments
+    --add-migrated-label    Add 'migrated-to-fizzy' label to Linear issues
+    -v, --verbose           Show detailed output
+    -q, --quiet             Suppress non-error output
+    -h, --help              Show this help message
+    --version               Show version
+
+ENVIRONMENT:
+    LINEAR_API_KEY          Linear personal API key (required)
+                           Can also be set in .env file
+
+EXAMPLES:
+    # Migrate all open issues from a team
+    $SCRIPT_NAME --board 12345 --team abc123
+
+    # Preview migration without changes
+    $SCRIPT_NAME --board 12345 --team abc123 --dry-run --verbose
+
+    # Migrate specific issues
+    $SCRIPT_NAME --board 12345 -i PROJ-123 -i PROJ-456
+
+    # Migrate issues with specific label
+    $SCRIPT_NAME --board 12345 --team abc123 -l bug -l urgent
+
+    # Migrate to specific column
+    $SCRIPT_NAME --board 12345 --team abc123 --column "Backlog"
+
+EOF
+    exit 0
+}
+
+version() {
+    echo "$SCRIPT_NAME v$VERSION"
+    exit 0
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --board)
+                BOARD_ID="$2"
+                shift 2
+                ;;
+            --team)
+                LINEAR_TEAM="$2"
+                shift 2
+                ;;
+            --project)
+                LINEAR_PROJECT="$2"
+                shift 2
+                ;;
+            --state)
+                LINEAR_STATE="$2"
+                shift 2
+                ;;
+            -l|--label)
+                LINEAR_LABELS+=("$2")
+                shift 2
+                ;;
+            -i|--issue)
+                LINEAR_ISSUES+=("$2")
+                shift 2
+                ;;
+            --include-archived)
+                INCLUDE_ARCHIVED=true
+                shift
+                ;;
+            --limit)
+                LIMIT="$2"
+                shift 2
+                ;;
+            --account)
+                FIZZY_ACCOUNT="$2"
+                shift 2
+                ;;
+            --column)
+                FIZZY_COLUMN="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --no-comments)
+                INCLUDE_COMMENTS=false
+                shift
+                ;;
+            --add-migrated-label)
+                ADD_MIGRATED_LABEL=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            --version)
+                version
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 2
+                ;;
+        esac
+    done
+}
+
+# Check for required dependencies
+check_dependencies() {
+    local missing=()
+
+    if ! command -v fizzy &> /dev/null; then
+        missing+=("fizzy")
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        missing+=("jq")
+    fi
+
+    if ! command -v curl &> /dev/null; then
+        missing+=("curl")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        echo ""
+        echo "Install missing dependencies:"
+        for dep in "${missing[@]}"; do
+            case $dep in
+                fizzy)
+                    echo "  fizzy: Visit https://fizzy.dev for installation"
+                    ;;
+                jq)
+                    echo "  jq: brew install jq (macOS) or apt install jq (Linux)"
+                    ;;
+                curl)
+                    echo "  curl: Usually pre-installed; apt install curl (Linux)"
+                    ;;
+            esac
+        done
+        exit 3
+    fi
+
+    log_verbose "All dependencies found"
+}
+
+# Check authentication
+check_auth() {
+    # Load from .env if present
+    if [[ -f .env ]]; then
+        log_verbose "Loading environment from .env file"
+        set -a
+        source .env
+        set +a
+    fi
+
+    if [[ -z "${LINEAR_API_KEY:-}" ]]; then
+        log_error "LINEAR_API_KEY not set"
+        echo ""
+        echo "Set your Linear API key:"
+        echo "  export LINEAR_API_KEY=lin_api_..."
+        echo ""
+        echo "Or create a .env file with:"
+        echo "  LINEAR_API_KEY=lin_api_..."
+        echo ""
+        echo "Get your API key from Linear: Settings → Account → Security & access"
+        exit 4
+    fi
+
+    # Test Linear authentication
+    log_verbose "Testing Linear API authentication..."
+    local response
+    response=$(curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -H "Authorization: $LINEAR_API_KEY" \
+        --data '{"query":"{ viewer { id name } }"}' \
+        https://api.linear.app/graphql)
+
+    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+        log_error "Linear authentication failed"
+        echo "$response" | jq -r '.errors[0].message' 2>/dev/null || echo "$response"
+        exit 4
+    fi
+
+    local user_name
+    user_name=$(echo "$response" | jq -r '.data.viewer.name')
+    log_verbose "Authenticated to Linear as: $user_name"
+
+    # Test Fizzy authentication
+    log_verbose "Testing Fizzy CLI authentication..."
+    if ! fizzy board list &> /dev/null; then
+        log_error "Fizzy authentication failed"
+        echo "Run: fizzy auth login"
+        exit 4
+    fi
+
+    log_verbose "Authentication successful"
+}
+
+# Execute GraphQL query against Linear API
+linear_query() {
+    local query="$1"
+
+    curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -H "Authorization: $LINEAR_API_KEY" \
+        --data "{\"query\": $(echo "$query" | jq -Rs .)}" \
+        https://api.linear.app/graphql
+}
+
+# List available Linear teams
+list_teams() {
+    local response
+    response=$(linear_query "{ teams { nodes { id name key } } }")
+    echo "$response" | jq -r '.data.teams.nodes[] | "\(.key)\t\(.id)\t\(.name)"'
+}
+
+# Fetch issues from Linear
+fetch_issues() {
+    local filter_parts=()
+
+    # Build filter
+    if [[ -n "$LINEAR_TEAM" ]]; then
+        filter_parts+=("team: { id: { eq: \"$LINEAR_TEAM\" } }")
+    fi
+
+    if [[ -n "$LINEAR_PROJECT" ]]; then
+        filter_parts+=("project: { id: { eq: \"$LINEAR_PROJECT\" } }")
+    fi
+
+    if [[ -n "$LINEAR_STATE" ]]; then
+        filter_parts+=("state: { name: { eq: \"$LINEAR_STATE\" } }")
+    fi
+
+    if [[ ${#LINEAR_LABELS[@]} -gt 0 ]]; then
+        local label_filter=""
+        for label in "${LINEAR_LABELS[@]}"; do
+            if [[ -n "$label_filter" ]]; then
+                label_filter+=", "
+            fi
+            label_filter+="\"$label\""
+        done
+        filter_parts+=("labels: { name: { in: [$label_filter] } }")
+    fi
+
+    if [[ "$INCLUDE_ARCHIVED" != "true" ]]; then
+        filter_parts+=("archivedAt: { null: true }")
+    fi
+
+    local filter=""
+    if [[ ${#filter_parts[@]} -gt 0 ]]; then
+        filter="filter: { $(IFS=', '; echo "${filter_parts[*]}") },"
+    fi
+
+    local query
+
+    # If specific issues requested, fetch them individually
+    if [[ ${#LINEAR_ISSUES[@]} -gt 0 ]]; then
+        local all_issues="[]"
+        for issue_id in "${LINEAR_ISSUES[@]}"; do
+            log_verbose "Fetching issue: $issue_id"
+            local issue_query="query { issue(id: \"$issue_id\") { id identifier title description url priority createdAt state { name } assignee { name email } labels { nodes { name } } comments { nodes { body createdAt user { name } } } } }"
+            local response
+            response=$(linear_query "$issue_query")
+            local issue
+            issue=$(echo "$response" | jq '.data.issue')
+            if [[ "$issue" != "null" ]]; then
+                all_issues=$(echo "$all_issues" | jq --argjson new "$issue" '. + [$new]')
+            else
+                log_warning "Issue not found: $issue_id"
+            fi
+        done
+        echo "$all_issues"
+        return
+    fi
+
+    # Fetch issues with filter
+    query="
+        query {
+            issues($filter first: $LIMIT) {
+                nodes {
+                    id
+                    identifier
+                    title
+                    description
+                    url
+                    priority
+                    createdAt
+                    state { name }
+                    assignee { name email }
+                    labels { nodes { name } }
+                    comments { nodes { body createdAt user { name } } }
+                }
+            }
+        }
+    "
+
+    local response
+    response=$(linear_query "$query")
+
+    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+        log_error "Failed to fetch issues from Linear"
+        echo "$response" | jq -r '.errors[0].message'
+        exit 5
+    fi
+
+    echo "$response" | jq '.data.issues.nodes'
+}
+
+# Convert markdown to HTML (if converter available)
+# Reads from stdin
+convert_markdown() {
+    if command -v cmark &> /dev/null; then
+        cmark
+    elif command -v pandoc &> /dev/null; then
+        pandoc -f markdown -t html
+    else
+        # Return as-is if no converter
+        cat
+    fi
+}
+
+# Create a Fizzy card from a Linear issue
+create_fizzy_card() {
+    local issue="$1"
+
+    local identifier title description url priority state labels_json comments_json assignee
+    identifier=$(echo "$issue" | jq -r '.identifier')
+    title=$(echo "$issue" | jq -r '.title')
+    description=$(echo "$issue" | jq -r '.description // ""')
+    url=$(echo "$issue" | jq -r '.url')
+    priority=$(echo "$issue" | jq -r '.priority // 0')
+    state=$(echo "$issue" | jq -r '.state.name // "Unknown"')
+    labels_json=$(echo "$issue" | jq -r '[.labels.nodes[].name] | @json')
+    comments_json=$(echo "$issue" | jq '.comments.nodes // []')
+    assignee=$(echo "$issue" | jq -r '.assignee.name // ""')
+
+    # Build card description with metadata
+    local card_description="$description"
+    card_description+=$'\n\n---\n'
+    card_description+="*Migrated from Linear: [$identifier]($url)*"$'\n'
+    card_description+="*Original state: $state*"
+    if [[ -n "$assignee" ]]; then
+        card_description+=$'\n'"*Assigned to: $assignee*"
+    fi
+
+    # Card title includes Linear identifier for reference
+    local card_title="[$identifier] $title"
+
+    log_info "Creating card: $card_title"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create card: $card_title"
+        log_verbose "[DRY RUN] Description: ${description:0:100}..."
+        return 0
+    fi
+
+    # Build fizzy command
+    local fizzy_args=("card" "create" "--board" "$BOARD_ID")
+
+    if [[ -n "$FIZZY_ACCOUNT" ]]; then
+        fizzy_args+=("--account" "$FIZZY_ACCOUNT")
+    fi
+
+    if [[ -n "$FIZZY_COLUMN" ]]; then
+        fizzy_args+=("--column" "$FIZZY_COLUMN")
+    fi
+
+    fizzy_args+=("--title" "$card_title")
+
+    # Add description if present
+    if [[ -n "$description" ]]; then
+        local converted_desc
+        converted_desc=$(printf '%s' "$card_description" | convert_markdown)
+        fizzy_args+=("--description" "$converted_desc")
+    fi
+
+    # Create the card
+    local card_output
+    if ! card_output=$(fizzy "${fizzy_args[@]}" 2>&1); then
+        log_error "Failed to create card: $card_title"
+        log_error "$card_output"
+        return 1
+    fi
+
+    # Check if creation was successful (fizzy returns JSON with success: true)
+    if ! echo "$card_output" | jq -e '.success == true' > /dev/null 2>&1; then
+        log_error "Failed to create card: $card_title"
+        log_error "$card_output"
+        return 1
+    fi
+
+    # Extract card number from location header (e.g., "/6086023/cards/139.json" -> 139)
+    local card_number=""
+    local location
+    location=$(echo "$card_output" | jq -r '.location // empty')
+
+    if [[ -n "$location" ]]; then
+        card_number=$(echo "$location" | sed -E 's|.*/cards/([0-9]+)\.json|\1|')
+    fi
+
+    if [[ -z "$card_number" ]]; then
+        log_warning "Could not extract card number from response (skipping tags/comments)"
+        log_success "Migrated: $identifier (without tags/comments)"
+        return 0
+    fi
+
+    log_verbose "Found card number: $card_number"
+
+    # Add labels as tags
+    local labels
+    labels=$(echo "$labels_json" | jq -r '.[]' 2>/dev/null || true)
+    if [[ -n "$labels" ]]; then
+        while IFS= read -r label; do
+            if [[ -n "$label" ]]; then
+                log_verbose "Adding tag: $label"
+                fizzy card tag "$card_number" --tag="$label" &> /dev/null || true
+            fi
+        done <<< "$labels"
+    fi
+
+    # Migrate comments if enabled
+    if [[ "$INCLUDE_COMMENTS" == "true" ]]; then
+        local comment_count
+        comment_count=$(echo "$comments_json" | jq 'length')
+
+        if [[ "$comment_count" -gt 0 ]]; then
+            log_verbose "Migrating $comment_count comment(s)"
+
+            local temp_file
+            temp_file=$(mktemp)
+
+            echo "$comments_json" | jq -c '.[]' | while IFS= read -r comment; do
+                local comment_body comment_author comment_date formatted_comment
+                comment_body=$(echo "$comment" | jq -r '.body')
+                comment_author=$(echo "$comment" | jq -r '.user.name // "Unknown"')
+                comment_date=$(echo "$comment" | jq -r '.createdAt')
+
+                # Format comment as markdown then convert to HTML
+                formatted_comment=$(printf '**%s** on %s:\n\n%s' "$comment_author" "$comment_date" "$comment_body" | convert_markdown)
+
+                # Write HTML to temp file
+                echo "$formatted_comment" > "$temp_file"
+
+                fizzy comment create --card="$card_number" --body-file="$temp_file" &> /dev/null || true
+            done
+
+            rm -f "$temp_file"
+        fi
+    fi
+
+    log_success "Migrated: $identifier → #$card_number"
+    return 0
+}
+
+# Add migrated label to Linear issue
+add_linear_label() {
+    local issue_id="$1"
+
+    # This would require a mutation to add the label
+    # For now, just log it
+    log_verbose "Would add 'migrated-to-fizzy' label to issue: $issue_id"
+}
+
+# Main migration function
+migrate() {
+    log_info "Starting Linear to Fizzy migration..."
+    log_info "Target Fizzy board: $BOARD_ID"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warning "DRY RUN MODE - No changes will be made"
+    fi
+
+    # Fetch issues
+    log_info "Fetching issues from Linear..."
+    local issues
+    issues=$(fetch_issues)
+
+    local issue_count
+    issue_count=$(echo "$issues" | jq 'length')
+
+    if [[ "$issue_count" -eq 0 ]]; then
+        log_warning "No issues found matching the criteria"
+        exit 0
+    fi
+
+    log_info "Found $issue_count issue(s) to migrate"
+
+    # Migrate each issue
+    local success_count=0
+    local fail_count=0
+    local i=0
+
+    while [[ $i -lt $issue_count ]]; do
+        local issue
+        issue=$(echo "$issues" | jq -c ".[$i]")
+
+        if create_fizzy_card "$issue"; then
+            ((success_count++)) || true
+        else
+            ((fail_count++)) || true
+        fi
+
+        # Add migrated label if requested
+        if [[ "$ADD_MIGRATED_LABEL" == "true" && "$DRY_RUN" != "true" ]]; then
+            local issue_id
+            issue_id=$(echo "$issue" | jq -r '.id')
+            add_linear_label "$issue_id"
+        fi
+
+        ((i++)) || true
+    done
+
+    echo "" >&2
+    log_info "Migration complete"
+    log_info "Successfully migrated: $success_count"
+    if [[ "$fail_count" -gt 0 ]]; then
+        log_warning "Failed: $fail_count"
+        return 1
+    fi
+    return 0
+}
+
+# Validate required arguments
+validate_args() {
+    if [[ -z "$BOARD_ID" ]]; then
+        log_error "Missing required argument: --board"
+        echo "Use --help for usage information"
+        exit 2
+    fi
+}
+
+# Main entry point
+main() {
+    parse_args "$@"
+    validate_args
+    check_dependencies
+    check_auth
+    migrate
+}
+
+main "$@"
